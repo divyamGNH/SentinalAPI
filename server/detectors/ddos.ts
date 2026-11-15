@@ -1,5 +1,6 @@
 import { Detector, RequestContext, DetectionResult } from '../types';
 import { Request } from 'express';
+import { counterEvidence, thresholds } from '../detectionState';
 
 export const ddosDetector: Detector = {
   name: 'Request Flood / DDoS',
@@ -9,26 +10,22 @@ export const ddosDetector: Detector = {
 
     counts.push(now);
     // Keep last 10 seconds
-    counts = counts.filter(t => now - t < 10000);
+    counts = counts.filter(t => now - t < thresholds.floodWindowMs);
     context.requestCountsByIp.set(context.ip, counts);
 
-    if (counts.length >= 50) {
-      // Flag and rate-limit/block globally
-      context.blockedIps.add(context.ip);
-      
-      // Auto-unblock after 30 seconds
-      setTimeout(() => {
-        context.blockedIps.delete(context.ip);
-        context.requestCountsByIp.set(context.ip, []);
-      }, 30000);
+    const evidence = counterEvidence('request-rate-v1', 'Request frequency', 'Counts recent requests in this detection scope.', counts.length, thresholds.flood, thresholds.floodWindowMs, 'requests');
+    if (counts.length >= thresholds.flood) {
+      context.blockedUntil = now + thresholds.blockMs;
 
       return {
         detectorName: this.name,
         severity: 'high',
-        reason: `Request flood detected (${counts.length} requests in 10s)`
+        reason: `Request flood detected (${counts.length} requests in 10s)`,
+        evidence,
       };
     }
 
+    req.decisionEvidence?.push(evidence);
     return null;
   }
 };

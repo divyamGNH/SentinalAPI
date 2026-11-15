@@ -20,12 +20,13 @@ export const fileUploadDetector: Detector = {
       const hex = buffer.toString('hex', 0, 10).toUpperCase();
       const str = buffer.toString('utf-8', 0, 10);
 
-      if (hex.startsWith('4D5A') || str.startsWith('<?php') || str.startsWith('#!/bin/')) {
+      if (hex.startsWith('4D5A') || hex.startsWith('7F454C46') || /^\s*<\?php/i.test(str) || str.startsWith('#!/bin/') || str.startsWith('#!/usr/')) {
         return {
           detectorName: this.name,
           severity: 'high',
           matchedPayload: hex.substring(0, 20),
-          reason: `Malicious file magic bytes detected (${file.originalname})`
+          reason: `Malicious file magic bytes detected (${file.originalname})`,
+          evidence: { rule: 'file-signature-v1', field: 'file (first bytes)', explanation: 'The uploaded bytes match a script or executable signature.' },
         };
       }
     }

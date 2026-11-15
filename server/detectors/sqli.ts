@@ -1,27 +1,29 @@
-import { Detector, RequestContext, DetectionResult } from '../types';
+import { Detector } from '../types';
 import { Request } from 'express';
+import { requestPayloads } from '../payloads';
 
-const SQLI_PATTERN = /(?:'|%27)\s*(?:OR|UNION|--|;|DROP|SELECT)|(?:UNION\s+SELECT)|(?:;--)/i;
+const SQLI_PATTERN = /(?:['"]\s*(?:or|and)\s+\S+\s*=)|\bunion\s+(?:all\s+)?select\b|;\s*(?:drop|delete|update|insert|select)\b|\b(?:sleep|benchmark|pg_sleep)\s*\(|['"]\s*--|\bor\s+\d+\s*=\s*\d+/i;
+
+export function matchesSqlSignature(normalized: string) {
+  return SQLI_PATTERN.test(normalized);
+}
 
 export const sqlInjectionDetector: Detector = {
   name: 'SQL Injection',
-  check(req: Request, context: RequestContext): DetectionResult | null {
-    const payloads = [
-      ...Object.values(req.query),
-      ...Object.values(req.body || {})
-    ].filter(v => typeof v === 'string') as string[];
+  check(req: Request) {
+    const input = requestPayloads(req).find(item => matchesSqlSignature(item.value));
+    if (!input) return null;
 
-    for (const payload of payloads) {
-      if (SQLI_PATTERN.test(payload)) {
-        return {
-          detectorName: this.name,
-          severity: 'high',
-          matchedPayload: payload.substring(0, 50),
-          reason: `SQLi pattern found in payload: '${payload.substring(0, 20)}...'`
-        };
-      }
-    }
-
-    return null;
-  }
+    return {
+      detectorName: this.name,
+      severity: 'high',
+      matchedPayload: input.sensitive ? '[redacted]' : input.value.slice(0, 50),
+      reason: input.sensitive ? 'SQL Injection pattern found in a redacted field' : `SQL Injection pattern found: '${input.value.slice(0, 20)}...'`,
+      evidence: {
+        rule: 'sql-signature-v1',
+        field: input.field,
+        explanation: 'Matched a SQL signature in normalized input.',
+      },
+    };
+  },
 };

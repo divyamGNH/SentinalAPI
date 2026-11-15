@@ -1,8 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
-import { RequestContext, Detector, DetectionResult } from './types';
+import { Detector, DetectionResult } from './types';
 import { insertAlert } from './db';
-
-// Import detectors (to be implemented)
+import { counterEvidence, getDetectionState, thresholds } from './detectionState';
+import { simulationLane } from './simulationContext';
 import { sqlInjectionDetector } from './detectors/sqli';
 import { xssDetector } from './detectors/xss';
 import { pathTraversalDetector } from './detectors/pathTraversal';
@@ -13,115 +13,76 @@ import { ddosDetector } from './detectors/ddos';
 import { ssrfDetector } from './detectors/ssrf';
 import { fileUploadDetector } from './detectors/fileUpload';
 import { scannerDetector } from './detectors/scanner';
-import { enumDetector } from './detectors/enum';
 
-// Global state for stateful detectors
-const globalContextState = {
-  failedLoginsByIp: new Map<string, number[]>(),
-  credStuffingLogins: new Map<string, Map<string, Set<string>>>(),
-  requestCountsByIp: new Map<string, number[]>(),
-  notFoundCountsByIp: new Map<string, number[]>(),
-  blockedIps: new Set<string>()
-};
-
-// Ordered chain of detectors
-const detectors: Detector[] = [
-  ddosDetector,
-  scannerDetector,
-  sqlInjectionDetector,
-  xssDetector,
-  pathTraversalDetector,
-  cmdInjectionDetector,
-  bruteforceDetector,
-  credStuffingDetector,
-  ssrfDetector,
-  fileUploadDetector,
-  enumDetector // Not technically possible to run effectively on request entry if it tracks 404s, but we'll adapt it.
-];
+const detectors: Detector[] = [ddosDetector, scannerDetector, sqlInjectionDetector, xssDetector,
+  pathTraversalDetector, cmdInjectionDetector, bruteforceDetector, credStuffingDetector, ssrfDetector, fileUploadDetector];
 
 export async function sentinelMiddleware(req: Request, res: Response, next: NextFunction) {
-  // Monitoring endpoints must stay reachable even when the local attack
-  // simulator temporarily blocks its own localhost IP during the DDoS demo.
-  if (req.path === '/alerts' || req.path.startsWith('/alerts/')) {
-    return next();
-  }
-
-  const ip = req.ip || req.connection.remoteAddress || 'unknown';
-
-  const context: RequestContext = {
-    ip,
-    ...globalContextState
+  if (req.path === '/alerts' || req.path.startsWith('/alerts/')) return next();
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const runId = req.header('x-sentinel-run');
+  const caseId = req.header('x-sentinel-case');
+  const lane = runId && caseId ? simulationLane(runId, req.authUser!.id, caseId) : undefined;
+  if ((runId || caseId) && !lane) return res.status(400).json({ error: 'Invalid or finished simulation context' });
+  if (lane) req.decisionEvidence = [];
+  const attachDecisions = () => {
+    if (req.decisionEvidence?.length) {
+      res.setHeader('x-sentinel-decisions', Buffer.from(JSON.stringify(req.decisionEvidence)).toString('base64url'));
+    }
+  };
+  const namespace = lane ? `simulation:${runId}:${lane}` : `user:${req.authUser!.id}:${ip}`;
+  const context = getDetectionState(namespace, ip);
+  const log = async (result: DetectionResult) => {
+    const alert = await insertAlert({
+      user_id: req.authUser!.id, source_ip: ip, detector_name: result.detectorName,
+      severity: result.severity, matched_payload: result.matchedPayload || '',
+      request_path: req.path === '/login' ? req.path : req.originalUrl.slice(0, 2000), reason: result.reason,
+      simulation_id: runId,
+      simulation_case_id: caseId,
+      decision_evidence: result.evidence,
+    });
+    if (result.evidence) req.decisionEvidence?.push(result.evidence);
+    res.setHeader('x-sentinel-detector', result.detectorName);
+    res.setHeader('x-sentinel-alert-id', String(alert.id));
+    req.app.emit('new-alert', req.authUser!.id);
   };
 
-  // If globally blocked by DDoS
-  if (context.blockedIps.has(ip)) {
-    return res.status(403).json({ error: 'Forbidden: IP temporarily blocked.' });
-  }
-
-  let isBlocked = false;
-
-  for (const detector of detectors) {
-    try {
-      const result = detector.check(req, context);
-      
-      if (result) {
-        // Log alert
-        await insertAlert({
-          source_ip: ip,
-          detector_name: result.detectorName,
-          severity: result.severity,
-          matched_payload: result.matchedPayload || '',
-          request_path: req.originalUrl,
-          reason: result.reason
-        });
-
-        // Broadcast to SSE clients (will implement an EventEmitter in index.ts)
-        req.app.emit('new-alert');
-
-        if (result.severity === 'high') {
-          isBlocked = true;
-          return res.status(403).json({ error: 'Forbidden: Malicious activity detected.' });
-        }
-      }
-    } catch (err) {
-      console.error(`Detector ${detector.name} failed:`, err);
+  try {
+    if (context.blockedUntil > Date.now()) {
+      res.setHeader('Retry-After', Math.ceil((context.blockedUntil - Date.now()) / 1000));
+      req.decisionEvidence?.push({ rule: 'request-cooldown-v1', field: 'Request frequency', explanation: 'The temporary rate limit is still active.' });
+      attachDecisions();
+      return res.status(429).json({ error: 'Request rate exceeded. Temporary cooldown.' });
     }
-  }
+    if (context.blockedUntil) { context.blockedUntil = 0; context.requestCountsByIp.clear(); }
 
-  if (!isBlocked) {
-    // We need to capture 404s for the enumDetector.
-    // We'll hook into the response finish event.
-    res.on('finish', async () => {
-      if (res.statusCode === 404) {
-        // Track 404s
-        let counts = context.notFoundCountsByIp.get(ip) || [];
-        const now = Date.now();
-        counts.push(now);
-        // keep last 20s
-        counts = counts.filter(t => now - t < 20000);
-        context.notFoundCountsByIp.set(ip, counts);
-
-        if (counts.length >= 15) {
-          // Flag as enumeration
-          try {
-            await insertAlert({
-              source_ip: ip,
-              detector_name: enumDetector.name,
-              severity: 'medium',
-              matched_payload: '',
-              request_path: req.originalUrl,
-              reason: `Endpoint enumeration detected (${counts.length} 404s in 20s)`
-            });
-            req.app.emit('new-alert');
-          } catch (err) {
-            console.error('Failed to log endpoint enumeration alert:', err);
-          }
-          // clear counts after alerting to prevent spam
-          context.notFoundCountsByIp.set(ip, []);
-        }
+    for (const detector of detectors) {
+      const result = await detector.check(req, context);
+      if (result) {
+        await log(result);
+        attachDecisions();
+        return res.status(detector === ddosDetector ? 429 : 403).json({ error: 'Request blocked by security policy', detector: result.detectorName });
       }
-    });
+    }
 
+    // Enumeration is known only after route resolution. Log before returning the 404,
+    // making the alert visible when a test receives its response.
+    if (!['/login', '/search', '/fetch', '/upload'].includes(req.path) && !/^\/profile\/[^/]+$/.test(req.path)) {
+      const now = Date.now();
+      const counts = [...(context.notFoundCountsByIp.get(ip) || []), now].filter(t => now - t < thresholds.enumWindowMs);
+      context.notFoundCountsByIp.set(ip, counts);
+      const evidence = counterEvidence('missing-routes-v1', 'Request path', 'Counts recent requests for missing routes. The response remains HTTP 404.', counts.length, thresholds.enumeration, thresholds.enumWindowMs, 'missing routes');
+      if (counts.length >= thresholds.enumeration) {
+        await log({ detectorName: 'Endpoint Enumeration', severity: 'medium', reason: `Endpoint enumeration detected (${counts.length} 404s in 20s)`, evidence });
+        context.notFoundCountsByIp.set(ip, []);
+      } else req.decisionEvidence?.push(evidence);
+      attachDecisions();
+      return res.status(404).json({ error: 'Endpoint not found' });
+    }
+    attachDecisions();
     next();
+  } catch (error) {
+    console.error('Security inspection failed:', error);
+    return res.status(503).json({ error: 'Security inspection unavailable; request rejected' });
   }
 }

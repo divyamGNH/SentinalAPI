@@ -13,7 +13,8 @@ export const scannerDetector: Detector = {
         detectorName: this.name,
         severity: 'high',
         matchedPayload: userAgent,
-        reason: `Known attack tool User-Agent detected: '${userAgent}'`
+        reason: `Known attack tool User-Agent detected: '${userAgent}'`,
+        evidence: { rule: 'scanner-header-v1', field: 'header.User-Agent', explanation: 'Matched a known tool signature in the client header.' },
       };
     }
 
